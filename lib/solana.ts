@@ -1,4 +1,12 @@
-import { Connection, PublicKey, clusterApiUrl, LAMPORTS_PER_SOL, Transaction, SystemProgram, TransactionInstruction } from '@solana/web3.js';
+import {
+  Connection,
+  PublicKey,
+  clusterApiUrl,
+  LAMPORTS_PER_SOL,
+  Transaction,
+  SystemProgram,
+  TransactionInstruction,
+} from '@solana/web3.js';
 
 export const DEVNET_RPC_URL = clusterApiUrl('devnet');
 export const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
@@ -11,7 +19,9 @@ export interface PhantomProvider {
   };
   connect(options?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: { toString(): string } }>;
   disconnect(): Promise<void>;
-  signAndSendTransaction(transaction: Transaction): Promise<{ signature: string }>;
+  signTransaction?(transaction: Transaction): Promise<Transaction>;
+  signAllTransactions?(transactions: Transaction[]): Promise<Transaction[]>;
+  signAndSendTransaction?(transaction: Transaction, options?: any): Promise<{ signature: string } | string>;
   on(event: string, callback: (...args: any[]) => void): void;
   removeListener(event: string, callback: (...args: any[]) => void): void;
 }
@@ -39,7 +49,7 @@ export async function fetchSolBalance(address: string): Promise<number> {
   try {
     const connection = new Connection(DEVNET_RPC_URL, 'confirmed');
     const pubKey = new PublicKey(address);
-    const balanceInLamports = await connection.getBalance(pubKey);
+    const balanceInLamports = await connection.getBalance(pubKey, 'confirmed');
     return balanceInLamports / LAMPORTS_PER_SOL;
   } catch (error) {
     console.error('Error fetching Solana balance:', error);
@@ -51,53 +61,111 @@ export async function requestDevnetAirdrop(address: string): Promise<string> {
   const connection = new Connection(DEVNET_RPC_URL, 'confirmed');
   const pubKey = new PublicKey(address);
   const signature = await connection.requestAirdrop(pubKey, 1 * LAMPORTS_PER_SOL);
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  await connection.confirmTransaction({
-    signature,
-    blockhash,
-    lastValidBlockHeight,
-  });
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  await connection.confirmTransaction(
+    {
+      signature,
+      blockhash,
+      lastValidBlockHeight,
+    },
+    'confirmed'
+  );
   return signature;
 }
 
+/**
+ * Sends a real SOL transfer on Solana Devnet via Phantom.
+ * Truly signs via Phantom and broadcasts raw transaction to Devnet.
+ * Debits user wallet and credits recipient wallet.
+ */
 export async function sendSolDonation(
   provider: PhantomProvider,
   recipientAddress: string,
   amountInSol: number
 ): Promise<string> {
   if (!provider.publicKey) {
-    throw new Error('Кошелек не подключен');
+    throw new Error('Кошелек Phantom не подключен');
   }
 
-  const connection = new Connection(DEVNET_RPC_URL, 'confirmed');
+  const connection = new Connection(DEVNET_RPC_URL, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000,
+  });
+
   const fromPubkey = new PublicKey(provider.publicKey.toString());
   const toPubkey = new PublicKey(recipientAddress);
+
+  const lamports = Math.round(amountInSol * LAMPORTS_PER_SOL);
+  if (lamports <= 0) {
+    throw new Error('Сумма пожертвования должна быть больше 0 SOL');
+  }
+
+  // Pre-flight balance verification
+  const currentLamports = await connection.getBalance(fromPubkey, 'confirmed');
+  if (currentLamports < lamports + 5000) {
+    const currentSol = currentLamports / LAMPORTS_PER_SOL;
+    throw new Error(
+      `Недостаточно SOL на балансе (${currentSol.toFixed(4)} SOL). Для перевода ${amountInSol} SOL + комиссии сети запросите тестовый Devnet Airdrop в меню кошелька.`
+    );
+  }
 
   const transaction = new Transaction().add(
     SystemProgram.transfer({
       fromPubkey,
       toPubkey,
-      lamports: Math.round(amountInSol * LAMPORTS_PER_SOL),
+      lamports,
     })
   );
 
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
   transaction.recentBlockhash = blockhash;
   transaction.feePayer = fromPubkey;
 
-  const { signature } = await provider.signAndSendTransaction(transaction);
-  
-  await connection.confirmTransaction({
-    signature,
-    blockhash,
-    lastValidBlockHeight,
-  }, 'confirmed');
+  let signature: string;
+
+  // Real signing in Phantom:
+  // Using signTransaction + sendRawTransaction ensures the transaction is sent directly
+  // to Solana Devnet RPC, preventing conflicts if Phantom is internally set to Mainnet.
+  if (typeof provider.signTransaction === 'function') {
+    const signedTx = await provider.signTransaction(transaction);
+    signature = await connection.sendRawTransaction(signedTx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+  } else if (typeof provider.signAndSendTransaction === 'function') {
+    const res = await provider.signAndSendTransaction(transaction);
+    signature = typeof res === 'string' ? res : res.signature;
+  } else {
+    throw new Error('Установленная версия Phantom не поддерживает подписание транзакций');
+  }
+
+  if (!signature) {
+    throw new Error('Не удалось получить подпись транзакции от кошелька');
+  }
+
+  // Wait for confirmation on Solana Devnet
+  try {
+    await connection.confirmTransaction(
+      {
+        signature,
+        blockhash,
+        lastValidBlockHeight,
+      },
+      'confirmed'
+    );
+  } catch (confirmErr) {
+    console.warn('Direct confirm timed out, checking transaction status...', confirmErr);
+    const status = await connection.getSignatureStatus(signature);
+    if (status?.value?.err) {
+      throw new Error(`Транзакция завершилась с ошибкой сети: ${JSON.stringify(status.value.err)}`);
+    }
+  }
 
   return signature;
 }
 
 /**
- * Sends a Memo transaction to Solana Devnet using SPL Memo program.
+ * Sends a real Memo transaction to Solana Devnet using SPL Memo program.
  * Encodes text using TextEncoder (not Buffer).
  * Fee is paid by the user's wallet.
  */
@@ -109,12 +177,24 @@ export async function sendMemoTransaction(
     throw new Error('Кошелек Phantom не подключен');
   }
 
-  const connection = new Connection(DEVNET_RPC_URL, 'confirmed');
+  const connection = new Connection(DEVNET_RPC_URL, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000,
+  });
+
   const userPubkey = new PublicKey(provider.publicKey.toString());
 
   // Strictly use TextEncoder, not Buffer
   const encoder = new TextEncoder();
   const memoData = encoder.encode(memoText);
+
+  // Check balance for minimum network fee (~0.000005 SOL)
+  const balance = await connection.getBalance(userPubkey, 'confirmed');
+  if (balance < 5000) {
+    throw new Error(
+      'На вашем балансе 0 SOL. Для оплаты сетевой комиссии Solana Devnet (~0.000005 SOL) запросите бесплатный 1 SOL кнопкой «Запросить +1 SOL» в меню кошелька.'
+    );
+  }
 
   const memoInstruction = new TransactionInstruction({
     keys: [{ pubkey: userPubkey, isSigner: true, isWritable: true }],
@@ -128,16 +208,41 @@ export async function sendMemoTransaction(
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
   transaction.recentBlockhash = blockhash;
 
-  const { signature } = await provider.signAndSendTransaction(transaction);
+  let signature: string;
 
-  await connection.confirmTransaction(
-    {
-      signature,
-      blockhash,
-      lastValidBlockHeight,
-    },
-    'confirmed'
-  );
+  if (typeof provider.signTransaction === 'function') {
+    const signedTx = await provider.signTransaction(transaction);
+    signature = await connection.sendRawTransaction(signedTx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+  } else if (typeof provider.signAndSendTransaction === 'function') {
+    const res = await provider.signAndSendTransaction(transaction);
+    signature = typeof res === 'string' ? res : res.signature;
+  } else {
+    throw new Error('Phantom не поддерживает подписание транзакций');
+  }
+
+  if (!signature) {
+    throw new Error('Не удалось получить подпись транзакции');
+  }
+
+  try {
+    await connection.confirmTransaction(
+      {
+        signature,
+        blockhash,
+        lastValidBlockHeight,
+      },
+      'confirmed'
+    );
+  } catch (confirmErr) {
+    console.warn('Confirm wait timeout, checking signature status:', confirmErr);
+    const status = await connection.getSignatureStatus(signature);
+    if (status?.value?.err) {
+      throw new Error(`Ошибка транзакции: ${JSON.stringify(status.value.err)}`);
+    }
+  }
 
   return signature;
 }

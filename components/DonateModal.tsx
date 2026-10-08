@@ -86,62 +86,50 @@ export const DonateModal: React.FC<DonateModalProps> = ({
     try {
       const provider = getPhantomProvider();
 
-      // If Phantom is available and connected, attempt real blockchain transfer
-      if (provider && provider.publicKey && walletAddress) {
-        try {
-          const sig = await sendSolDonation(
-            provider,
-            campaign.scientist.solanaAddress,
-            currentSolAmount
-          );
-          setTxSignature(sig);
-          onDonateSuccess(
-            campaign.id,
-            currentSolAmount,
-            currentUsdAmount,
-            donorName.trim() || 'Phantom Donator',
-            donorMessage.trim(),
-            sig
-          );
-          onRefreshBalance();
-          setIsSuccess(true);
-          return;
-        } catch (chainErr: any) {
-          console.warn('Direct chain tx failed or rejected:', chainErr);
-          // If user rejected or balance insufficient, show message or fallback
-          if (chainErr.message?.includes('User rejected')) {
-            setErrorMessage('Транзакция отклонена в кошельке Phantom.');
-            setIsSubmitting(false);
-            return;
-          }
-          // If insufficient balance, warn user
-          if (solBalance !== null && solBalance < currentSolAmount) {
-            setErrorMessage(`Недостаточно SOL на балансе (${solBalance.toFixed(3)} SOL). Запросите Devnet Airdrop ниже.`);
-            setIsSubmitting(false);
-            return;
-          }
-        }
+      if (!provider || !provider.publicKey || !walletAddress) {
+        onConnectWallet();
+        setErrorMessage('Пожалуйста, сначала подключите кошелек Phantom для отправки транзакции.');
+        setIsSubmitting(false);
+        return;
       }
 
-      // Fallback test simulation if in sandbox iframe or extension unavailable
-      setTimeout(() => {
-        const dummySig = `sol-${Math.random().toString(36).substring(2, 10)}${Math.random().toString(36).substring(2, 10)}`;
-        setTxSignature(dummySig);
-        onDonateSuccess(
-          campaign.id,
-          currentSolAmount,
-          currentUsdAmount,
-          donorName.trim() || (walletAddress ? `Phantom (${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)})` : 'Анонимный крипто-донор'),
-          donorMessage.trim(),
-          dummySig
+      // Check balance before sending
+      if (solBalance !== null && solBalance < currentSolAmount) {
+        setErrorMessage(
+          `Недостаточно SOL на балансе (${solBalance.toFixed(4)} SOL). Для пожертвования ${currentSolAmount} SOL запросите Devnet Airdrop (+1 SOL).`
         );
         setIsSubmitting(false);
-        setIsSuccess(true);
-      }, 500);
+        return;
+      }
 
+      // Execute real Solana Devnet transfer
+      const sig = await sendSolDonation(
+        provider,
+        campaign.scientist.solanaAddress,
+        currentSolAmount
+      );
+
+      setTxSignature(sig);
+      onDonateSuccess(
+        campaign.id,
+        currentSolAmount,
+        currentUsdAmount,
+        donorName.trim() || `Phantom (${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)})`,
+        donorMessage.trim(),
+        sig
+      );
+      onRefreshBalance();
+      setIsSuccess(true);
     } catch (err: any) {
-      console.error(err);
-      setErrorMessage(err.message || 'Ошибка обработки транзакции');
+      console.error('Real Solana donation error:', err);
+      if (err?.code === 4001 || err?.message?.includes('User rejected')) {
+        setErrorMessage('Транзакция отменена: вы отклонили подписание в Phantom.');
+      } else if (err?.message?.includes('0x1') || err?.message?.includes('insufficient funds')) {
+        setErrorMessage('Недостаточно SOL на балансе для отправки пожертвования и оплаты комиссии сети.');
+      } else {
+        setErrorMessage(err.message || 'Ошибка обработки транзакции в сети Solana.');
+      }
+    } finally {
       setIsSubmitting(false);
     }
   };
