@@ -1,0 +1,6 @@
+{
+  "name": "AI Medical Research Bounty",
+  "description": "Платформа сбора средств и научных грантов для исследователей на решение нерешенных медицинских проблем и редких заболеваний.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
